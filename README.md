@@ -15,4 +15,4 @@ functionality.
 
 [lich]: <https://github.com/elanthia-online/lich-5>
 [revenant]: <https://github.com/jandersson/revenant>
-[textua]: <https://github.com/textualize/textual>
+[textual]: <https://github.com/textualize/textual>
