@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=62.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "urdaemon"
+description = "Scripting engine and TUI FE for Simutronics MUDs."
+readme = "README.md"
+keywords = [
+    "textual", "simutronics", "gemstone", "dragonrealms", "elanthia", "MUD",
+    "TUI"
+]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+]
+# NOTE: It is possible to use setuptools-scm to get versions from git tags.
+version = "2022.0.0"
+# dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = [
+    "black==22.3.0",
+    "pytest==7.1.1",
+    "isort==5.8.0",
+    "coverage==6.4",
+    "pytest-cov==3.0.0",
+    "twine==4.0.0",
+]
+
+[project.scripts]
+# typer cli
+# hello = "hello.cli.main:app"
