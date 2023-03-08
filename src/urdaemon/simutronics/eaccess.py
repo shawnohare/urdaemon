@@ -19,19 +19,17 @@ where the body is a tab separated list of parameters.
 8. Send actions C to obtain information about charactors, such as a mapping
    from character name to character code.
 9. Send Action L with character code as the body to select the character
-   and obtain game connection information.
+   and obtain game session connection information.
 10. Use response with any client.
 
 """
 import asyncio
-import platform
-import socket
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from itertools import islice
-from time import sleep
-from typing import Dict, Iterable, List, Literal, Self, Tuple
+from typing import Iterable
 
-from .games import GameInfo
+
+from urdaemon.simutronics.games import GameInfo
 
 
 class AuthenticationError(Exception):
@@ -39,10 +37,22 @@ class AuthenticationError(Exception):
 
 
 class Actions:
-    """EAccess Protocol action codes."""
+    """EAccess Protocol action codes.
+
+    - K (key) Server responses with password hash Key.
+    - A (account). Fetch account login key.
+    - M (manifest) Asks the server for a list of games
+    - N (?) Asks server for game capabilities
+    - G (game). Obtain game details.
+    - C (characters). List available characters.
+    - L (character login) Fetch character session login key.
+    - F (?) SGE Sends it... Server response: NORMAL
+    - B (?) zMUD Sends it... Server response: UNKNOWN
+    - P (?) SGE Sends it w/ gamecode.. Server response: ?
+    """
 
     GetPasswordEcryptionKey = "K"
-    AuthenticateAaccount = "A"
+    AuthenticateAccount = "A"
     GetGames = "M"
     GetGameCapabilities = "N"
     SelectGame = "G"
@@ -55,28 +65,32 @@ class Response:
     """EAccess server response.
 
     The raw payload is (usually) of the form
-    b'{action}['\t']{body}\n' where the body is a tab separated
-    list of values.
-    """
+    b"{action}['\t']{body}\n"
+    where the body is a tab separated list of values or alternating key value
+    pairs."""
 
     body: str
     request: bytes
 
-    def split(self) -> List[str]:
+    def split(self) -> list[str]:
         """Split tab separated response body values."""
         return self.body.split("\t")
 
-    def pairs(self, key_start: int = 0) -> Iterable[Tuple[str, str]]:
+    def pairs(self, swap: bool = False) -> Iterable[tuple[str, str]]:
         """Format response body as a list of (key, value) pairs, where
         the key / value are separated by a tab in the raw response.
 
         For example ["k0", "v0", "k1", "v1"] -> [("k0", "v0"), ("k1", "v1")]
+
+        Args:
+            swap: If the flag is set, assume (value, key) pairs instead.
         """
+        key_start = 0 if not swap else 1
         val_start = key_start ^ 1
         vals = self.split()
         return zip(islice(vals, key_start, None, 2), islice(vals, val_start, None, 2))
 
-    def json(self) -> Dict[str, str]:
+    def json(self) -> dict[str, str]:
         """Convert a body consisting of tab separated key=value pairs
         into a mapping.
         """
@@ -88,12 +102,54 @@ class Response:
         return jbody
 
 
-class Client:
+@dataclass(frozen=True)
+class SessionInfo:
+    """Contains the game host, port and character login key used by
+    the client to connect to the game server. This is the main
+    data structure returned from the EAccess Protocol for
+    authenticating a character session.
+
+    Attrs:
+        host: The game server host (GAMEHOST).
+        port: The game server port (GAMEPORT).
+        key: Session key (KEY).
+        upport: Unclear what this is (UPPORT).
+        game_code: The game code, which does not necessarily match the code
+            in GameInfo. Unused to establish a connection (GAMECODE).
+        frontend: Alias for (GAME).
+        frontend_full_name: Alias for (FULLGAMENAME).
+        frontend_exe: Name of the front-end executable (GAMEFILE).
+        ok: Indicates if the character session selection response was valid.
+    """
+
+    host: str = "storm.gs4.game.play.net"
+    port: int = 10024
+    key: str = ""
+    # Values below appear to be largely unused to establish a connection to
+    # the game server.
+    game_code: str = "GS"
+    upport: int = 5535
+    frontend: str = "STORM"
+    frontend_name: str = "Wrayth"
+    frontend_exe: str = "WRAYTH.EXE"
+    ok: bool = True
+
+
+@dataclass
+class Credentials:
+    account: str = ""
+    password: str = ""
+    game: str = ""
+    character: str = ""
+    profile: str = ""
+
+
+class EAccessClient:
     """A client to communicate with the Simutronics authentication
     server via the EAccess Protocol used by non-web clients
     such as the Simutronics Game Entry (SGE).
 
-    Authenticating a character profile
+    Selecting a character profile
     (a tuple of account, password, game, character) establishes a
     link between an account login key and character. Subsequent
     game client connections will instanstiate a game session for the
@@ -113,45 +169,29 @@ class Client:
 
     """
 
-    # '\n' == 10 == 0x0A
-    RECV_MESSAGE_END: int = 0x0A
-
     def __init__(self, host: str = "eaccess.play.net", port: int = 7900):
         self.host = host
         self.port = port
-        self.conn: socket.socket = socket.create_connection((host, port))
+        self.reader: asyncio.StreamReader
+        self.writer: asyncio.StreamWriter
 
-    def close(self) -> Self:
+    async def connect(self):
+        reader, writer = await asyncio.open_connection(self.host, self.port)
+        self.reader = reader
+        self.writer = writer
+
+    async def close(self):
         """Close socket connection."""
-        self.conn.close()
+        self.writer.close()
+        await self.writer.wait_closed()
 
-    def recv(self) -> bytes:
-        """Receive a message from the EAccess server. This consist of a
-        byte array terminated with the ASCII linefeed character '\n'.
-
-        Most any response fromt the EAccess
-        """
-        resp = bytes()
-        while not resp or resp[-1] != self.RECV_MESSAGE_END:
-            resp += self.conn.recv(1024)
-        return resp
-
-    def request(self, action: str, params: List[bytes | str] | None = None) -> Response:
+    async def request(
+        self, action: str, params: list[bytes | str] | None = None
+    ) -> Response:
         """Send a request to the EAccess server and wait for a response.
 
         Args:
             action: A single character code denoting the Protocol action.
-                A summary list
-                - K (key) Server responses with password hash Key.
-                - A (account). Fetch account login key.
-                - M (manifest) Asks the server for a list of games
-                - N (?) Asks server for game capabilities
-                - G (game). Obtain game details.
-                - C (characters). List available characters.
-                - L (character login) Fetch character session login key.
-                - F (?) SGE Sends it... Server response: NORMAL
-                - B (?) zMUD Sends it... Server response: UNKNOWN
-                - P (?) SGE Sends it w/ gamecode.. Server response: ?
             params: A list of parameters to include in the message payload,
                 e.g., the account name and encrypted password.
 
@@ -172,8 +212,12 @@ class Client:
             b"\t".join(x if isinstance(x, bytes) else x.encode() for x in params)
             + b"\n"
         )
-        self.conn.send(msg)
-        resp = self.recv().decode()
+        self.writer.write(msg)
+        await self.writer.drain()
+
+        raw = await self.reader.readuntil(b"\n")
+        resp = raw.decode("ascii")
+
         # Remove code prefix and subsequent tab if it exists and terminal newline.
         if resp.startswith(action):
             resp = resp[1:]
@@ -191,18 +235,18 @@ class Client:
         pairs = zip(password.encode(), hashkey.encode())
         return bytes(((((c - 32) ^ k) + 32) for c, k in pairs))
 
-    def get_password_ecryption_key(self) -> str:
+    async def get_password_ecryption_key(self) -> str:
         """Get the 32 byte hashkey used to obfuscate the account password."""
-        resp = self.request(Actions.GetPasswordEcryptionKey)
+        resp = await self.request(Actions.GetPasswordEcryptionKey)
         return resp.body
 
-    def get_games(self) -> Dict[str, str]:
+    async def get_games(self) -> dict[str, str]:
         """Obtain a list of game code and desription pairs."""
-        resp = self.request(Actions.GetGames)
+        resp = await self.request(Actions.GetGames)
         return resp.json()
 
-    def authenticate_account(self, account: str, password: str) -> str:
-        """Authenticate the account.
+    async def authenticate_account(self, account: str, password: str) -> str:
+        """Login to the account.
 
         Successive account-level protocol actions such as listing characters
         and game info.
@@ -214,10 +258,10 @@ class Client:
             Account login key.
 
         """
-        encryption_key = self.get_password_ecryption_key()
+        encryption_key = await self.get_password_ecryption_key()
         encrypted_pw = self.encrypt_password(password, encryption_key)
         params = [account, encrypted_pw]
-        resp = self.request(Actions.AuthenticateAaccount, params)
+        resp = await self.request(Actions.AuthenticateAccount, params)
         if "KEY" not in resp.body:
             raise AuthenticationError(resp)
         try:
@@ -226,7 +270,7 @@ class Client:
             raise AuthenticationError(resp)
         return key
 
-    def select_game(self, game: GameInfo | str) -> Dict[str, str]:
+    async def select_game(self, game: GameInfo | str) -> dict[str, str]:
         """Request game informations for the specified game.
 
         Effectively logs the account into the game portal so that
@@ -239,52 +283,45 @@ class Client:
             A dict containing game info.
         """
         code = game.code if isinstance(game, GameInfo) else game
-        resp = self.request(Actions.SelectGame, [code])
+        resp = await self.request(Actions.SelectGame, [code])
         return resp.json()
 
-    def get_characters(self) -> Dict[str, str]:
+    async def get_characters(self) -> dict[str, str]:
         """Get character names and codes.
+
+        Response starts with four metadata values
+        1. total number char slots
+        2. num character slots used
+        3. ?
+        4. ?
 
         Returns:
             A map of character name -> character code.
         """
-        resp = self.request(Actions.GetCharacters)
-        # Response starts with four metadata values
-        # 1. total number char slots, 2. num character slots used 3. ?, 4. ?
+        resp = await self.request(Actions.GetCharacters)
         return {k: v for i, (v, k) in enumerate(resp.pairs()) if i > 1}
 
-    def select_character(self, character: str) -> Dict[str, str]:
-        """Select the specified character and obtain a character login key.
+    async def select_character(
+        self, character: str, frontend: str = "STORM"
+    ) -> SessionInfo:
+        """Select the specified character and obtain game session login info.
+
+        The underlying action expects a character code obtained from the
+        `get_characters` name to code mapping as well as what looks like
+        a value (hardcoded to STORM) specifying either the game feed protocol
+        or client.
+
 
         Args:
             character: Character name.
+            frontend: STORM, WIZ, or AVALON.
 
         Raw response example
             b'L\tOK\tUPPORT=5535\tGAME=STORM\tGAMECODE=GS\tFULLGAMENAME=Wrayth\tGAMEFILE=WRAYTH.EXE\tGAMEHOST=storm.gs4.game.play.net\tGAMEPORT=10024\tKEY=8f478eed8c1f6db67bbbc115d1e3db0a\n'
 
-        Returns:
-            A map of character details, including the character login key.
-
-        """
-        characters = self.get_characters()
-        code = characters.get(character.title())
-        if code is None:
-            raise AuthenticationError(f"Unknown character {character}.")
-        resp = self.request(Actions.SelectCharacter, [code, "STORM"])
-        return resp.json()
-
-    def authenticate(
-        self, account: str, password: str, game: str, character: str
-    ) -> Dict[str, str]:
-        """The main entry point which authenticates a character login session.
-
-        The game and character selection process ties the character to the
-        login key, which is sent by the game connection client.
-
-        Returns:
-            A dict containing login information that can be used by game
-                clients to establish a connection. An example for Gemstone IV is
+        and converted into a dict
                 {
+                    'OK': '1',
                     'UPPORT': '5535',
                     'GAME': 'STORM',
                     'GAMECODE': 'GS',
@@ -294,8 +331,67 @@ class Client:
                     'GAMEPORT': '10024',
                     'KEY': '49a87e31c0d88c8224e0f040aaa7615b',
                  }
+
+
         """
-        self.authenticate_account(account, password)
-        self.select_game(game)
-        connection_info = self.select_character(character)
-        return connection_info
+        characters = await self.get_characters()
+        character_code = characters.get(character.title())
+        if character_code is None:
+            raise AuthenticationError(f"Unknown character {character}.")
+
+        # NOTE: Seems that the "front-end" can be STORM, WIZ, AVALON?
+        # We might want to only support STORM
+        resp = await self.request(
+            action=Actions.SelectCharacter,
+            params=[character_code, frontend],
+        )
+
+        # Fix body to contain "=" separated keys.
+        resp = replace(resp, body=resp.body.replace("OK\t", "OK=1\t"))
+        jresp = resp.json()
+
+        return SessionInfo(
+            host=jresp["GAMEHOST"],
+            port=int(jresp["GAMEPORT"]),
+            key=jresp["KEY"],
+            game_code=jresp["GAMECODE"],
+            upport=int(jresp["UPPORT"]),
+            frontend=jresp["GAME"],
+            frontend_name=jresp["FULLGAMENAME"],
+            frontend_exe=jresp["GAMEFILE"],
+            ok=jresp.get("OK") == "1",
+        )
+
+    async def authenticate(
+        self, account: str, password: str, game: str, character: str
+    ) -> SessionInfo:
+        """The main entry point which authenticates a character login session.
+
+        The game and character selection process ties the character to the
+        login key, which is sent by the game connection client.
+
+        """
+        await self.authenticate_account(account, password)
+        await self.select_game(game)
+        return await self.select_character(character)
+
+
+async def authenticate(
+    credentials: Credentials | dict[str, str],
+    host: str = "eaccess.play.net",
+    port: int = 7900,
+) -> SessionInfo:
+    """Authenticate a character login session.
+
+    Returns:
+        Game session connection details such as host, port, and session key
+        that are used to establish a socket connection to the game server.
+    """
+    if isinstance(credentials, Credentials):
+        credentials = asdict(credentials)
+    client = EAccessClient(host=host, port=port)
+    await client.connect()
+    credentials.pop("profile", None)
+    session_info = await client.authenticate(**credentials)
+    await client.close()
+    return session_info
