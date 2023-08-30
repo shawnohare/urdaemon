@@ -29,7 +29,7 @@ from itertools import islice
 from typing import Iterable
 
 
-from urdaemon.simutronics.games import GameInfo
+from .games import GameInfo
 
 
 class AuthenticationError(Exception):
@@ -362,24 +362,27 @@ class EAccessClient:
             ok=jresp.get("OK") == "1",
         )
 
-    async def authenticate(
-        self, account: str, password: str, game: str, character: str
-    ) -> SessionInfo:
-        """The main entry point which authenticates a character login session.
+    # TODO: Remove in favor of module function below?
+    # async def authenticate(
+    #     self, account: str, password: str, game: str, character: str
+    # ) -> SessionInfo:
+    #     """The main entry point which authenticates a character login session.
 
-        The game and character selection process ties the character to the
-        login key, which is sent by the game connection client.
+    #     The game and character selection process ties the character to the
+    #     login key, which is sent by the game connection client.
 
-        """
-        await self.authenticate_account(account, password)
-        await self.select_game(game)
-        return await self.select_character(character)
+    #     """
+    #     await self.authenticate_account(account, password)
+    #     await self.select_game(game)
+    #     return await self.select_character(character)
 
 
 async def authenticate(
-    credentials: Credentials | dict[str, str],
-    host: str = "eaccess.play.net",
-    port: int = 7900,
+    account: str,
+    password: str,
+    game: str,
+    character: str,
+    client: EAccessClient | None = None,
 ) -> SessionInfo:
     """Authenticate a character login session.
 
@@ -387,11 +390,10 @@ async def authenticate(
         Game session connection details such as host, port, and session key
         that are used to establish a socket connection to the game server.
     """
-    if isinstance(credentials, Credentials):
-        credentials = asdict(credentials)
-    client = EAccessClient(host=host, port=port)
+    client = client or EAccessClient()
     await client.connect()
-    credentials.pop("profile", None)
-    session_info = await client.authenticate(**credentials)
+    await client.authenticate_account(account, password)
+    await client.select_game(game)
+    session_info = await client.select_character(character)
     await client.close()
     return session_info
